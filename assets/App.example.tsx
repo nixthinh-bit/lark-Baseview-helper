@@ -25,11 +25,17 @@ export default function App() {
   const [draft, setDraft] = useState<Draft | null>(null);
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => { (async () => {
-    const [r, o] = await Promise.all([loadRows(), getSelectOptions('status')]);
-    setRows(r); setOptions(o); setLoading(false);
-    if (r.length) select(r[0], r);
+    try {
+      const [r, o] = await Promise.all([loadRows(), getSelectOptions('status')]);
+      setRows(r); setOptions(o);
+      if (r.length) select(r[0], r);
+    } catch (e) {
+      // Inside a Base but the read failed (e.g. no permission): show it, never fake data.
+      setLoadError((e as Error).message);
+    } finally { setLoading(false); }
   })(); }, []);
 
   const selected = rows.find((r) => r.recordId === selId) ?? null;
@@ -63,6 +69,7 @@ export default function App() {
   }
 
   if (loading) return (<><Style /><div className="muted" style={{ padding: 24 }}>Loading…</div></>);
+  if (loadError) return (<><Style /><div className="muted" style={{ padding: 24 }}>Could not read this table: {loadError}</div></>);
 
   return (
     <div className="app"><Style />

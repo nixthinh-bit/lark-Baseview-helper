@@ -29,6 +29,11 @@ let mockMode = false;
 export const isMock = () => mockMode;
 
 // ── 2) Bind to the active table; timeout ⇒ not inside Base ⇒ DEMO mode ──
+// Only this error means "not in Base". Anything else (permissions, a broken bridge)
+// is a real failure and must reach the UI, never be hidden behind DEMO data.
+class NotInBaseError extends Error {
+  constructor() { super('not-in-base'); }
+}
 async function ensureTable(): Promise<void> {
   if (table) return;
   table = await Promise.race([
@@ -39,7 +44,7 @@ async function ensureTable(): Promise<void> {
     })(),
     // Generous timeout: a real in-Base session on a slow network/host bridge can take a
     // few seconds. Too short and a slow-but-real session gets misclassified as DEMO mode.
-    new Promise((_, rej) => setTimeout(() => rej(new Error('not-in-base')), 4000)),
+    new Promise((_, rej) => setTimeout(() => rej(new NotInBaseError()), 4000)),
   ]);
   const metas: any[] = await table.getFieldMetaList();
   metaByName = new Map(metas.map((m) => [m.name, m]));
@@ -112,56 +117,85 @@ export function toSelect(v: any): { id: string; name: string } | null {
 // ── 5) Public API ──
 export type Row = { recordId: string } & Record<string, any>;
 
-/** Load all visible records, each as { recordId, <key>: value } per READ_SPEC. */
+// Max SDK calls in flight. Firing one call per record all at once floods the host
+// bridge on big tables, and the resulting timeouts look like real failures.
+const CONCURRENCY = 20;
+async function mapLimit<T, R>(items: T[], fn: (x: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, items.length) }, worker));
+  return out;
+}
+
+/**
+ * Load all visible records, each as { recordId, <key>: value } per READ_SPEC.
+ * Falls back to `demoRows` ONLY when not running inside a Base; any other error
+ * (no permission, SDK failure) is thrown so the UI can show it.
+ */
 export async function loadRows(demoRows: Row[] = []): Promise<Row[]> {
   try {
     await ensureTable();
-    const ids: (string | undefined)[] = await table.getRecordIdList();
-    const keys = Object.keys(READ_SPEC);
-    return Promise.all(
-      ids.filter((x): x is string => !!x).map(async (recordId) => {
-        const row: Row = { recordId };
-        await Promise.all(
-          keys.map(async (key) => {
-            const id = fid(key);
-            const raw: IOpenCellValue = id ? await table.getCellValue(id, recordId) : null;
-            const kind = READ_SPEC[key];
-            row[key] =
-              kind === 'num' ? toNum(raw)
-              : kind === 'select' ? toSelect(raw)
-              : toStr(raw);
-          }),
-        );
-        return row;
-      }),
-    );
   } catch (e) {
+    if (!(e instanceof NotInBaseError)) throw e;
     mockMode = true;
-    console.warn('[view] DEMO mode (not in Base):', (e as Error).message);
+    console.warn('[view] DEMO mode (not in Base)');
     return demoRows;
   }
+  // Resolve field ids once, not per record.
+  const cols = Object.entries(READ_SPEC).map(([key, kind]) => ({ key, kind, id: fid(key) }));
+  const ids: (string | undefined)[] = await table.getRecordIdList();
+  return mapLimit(
+    ids.filter((x): x is string => !!x),
+    async (recordId) => {
+      // One call per record (all fields) instead of one per record × field.
+      const { fields } = await table.getRecordById(recordId);
+      const row: Row = { recordId };
+      for (const { key, kind, id } of cols) {
+        const raw: IOpenCellValue = id ? fields[id] ?? null : null;
+        row[key] =
+          kind === 'num' ? toNum(raw)
+          : kind === 'select' ? toSelect(raw)
+          : toStr(raw);
+      }
+      return row;
+    },
+  );
 }
 
 /** Options of a single-select field, for filter chips / dropdowns. */
 export async function getSelectOptions(key: string): Promise<{ id: string; name: string }[]> {
   try {
     await ensureTable();
-    const opts: any[] = resolveMeta(FIELDS[key] ?? key)?.property?.options ?? [];
-    return opts.map((o) => ({ id: o.id, name: o.name }));
-  } catch {
+  } catch (e) {
+    if (!(e instanceof NotInBaseError)) throw e;
     mockMode = true;
     return [];
   }
+  const opts: any[] = resolveMeta(FIELDS[key] ?? key)?.property?.options ?? [];
+  return opts.map((o) => ({ id: o.id, name: o.name }));
 }
 
-/** Save editable fields (keys must be in WRITE_SPEC). select value = option id. */
+/**
+ * Save editable fields (keys must be in WRITE_SPEC). select value = option id.
+ * Throws, writing nothing, if any key is not in WRITE_SPEC or its field can't be
+ * found in the Base, so a renamed field never turns into a silent partial save.
+ */
 export async function saveRecord(recordId: string, values: Record<string, any>): Promise<void> {
   if (mockMode) { console.log('[view][DEMO] save', recordId, values); return; }
   await ensureTable();
+  const bad = Object.keys(values).filter((key) => !WRITE_SPEC[key] || !fid(key));
+  if (bad.length) {
+    throw new Error(`Not saved: field(s) not editable or not found in this Base: ${bad.join(', ')}`);
+  }
   const fields: Record<string, IOpenCellValue> = {};
   for (const [key, val] of Object.entries(values)) {
     const id = fid(key);
-    if (!id) continue;
     const kind = WRITE_SPEC[key];
     if (kind === 'num') fields[id] = (val ?? null) as IOpenCellValue;
     else if (kind === 'text') {
